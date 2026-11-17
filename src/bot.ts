@@ -1,4 +1,9 @@
 import "dotenv/config";
+import Simmit, {
+  isTerminal,
+  JobUnsuccessfulError,
+  type JobStatusResponse,
+} from "@simmit/sdk";
 import {
   Client,
   EmbedBuilder,
@@ -17,22 +22,13 @@ const SIMMIT_SECRET_KEY = requireEnv("SIMMIT_SECRET_KEY");
 const BNET_CLIENT_ID = requireEnv("BNET_CLIENT_ID");
 const BNET_CLIENT_SECRET = requireEnv("BNET_CLIENT_SECRET");
 
-const API = "https://api.simmit.com/v1";
-const TERMINAL = new Set(["completed", "failed", "cancelled", "timed_out"]);
-const POLL_INTERVAL_MS = 5_000;
-
 const COLOR_PROGRESS = 0x5865f2;
 const COLOR_SUCCESS = 0x57f287;
 const COLOR_FAILURE = 0xed4245;
 
-type JobStatus = {
-  status: string;
-  queue: { estimatedStartSeconds: number | null } | null;
-  progress: { percent: number | null } | null;
-};
-
 type Field = { name: string; value: string; inline?: boolean };
 
+const simmit = new Simmit({ secretKey: SIMMIT_SECRET_KEY });
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.once("clientReady", (c) => {
@@ -53,162 +49,86 @@ async function handleSim(interaction: ChatInputCommandInteraction) {
   const profileText = `target_error=0.05
 armory=${region},${realm},${character}
 `;
-  const baseEmbed = () =>
-    new EmbedBuilder().setTitle(`${character} · ${realm} (${region})`);
+  const show = (color: number, fields: Field[]) =>
+    interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`${character} · ${realm} (${region})`)
+          .setColor(color)
+          .addFields(fields),
+      ],
+    });
 
+  let id = "";
   try {
-    const submitRes = await fetch(`${API}/simc/jobs`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${SIMMIT_SECRET_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    const job = await simmit.jobs.createAndWait(
+      {
         build: { channel: "latest" },
         profile: { text: profileText },
         credentials: {
           bnetClientId: BNET_CLIENT_ID,
           bnetClientSecret: BNET_CLIENT_SECRET,
         },
-        artifacts: { html: true },
-        // Reserved credits scale with maxRuntimeSeconds, so cap low when sims will be fast.
-        runtime: { maxRuntimeSeconds: 120 },
-      }),
-    });
-    if (!submitRes.ok) {
-      throw new Error(
-        `submit failed (${submitRes.status}): ${await submitRes.text()}`,
-      );
-    }
-    const { id } = (await submitRes.json()) as { id: string };
-    console.log(`[sim] submitted ${id}`);
-    await interaction.editReply({
-      embeds: [
-        baseEmbed()
-          .setColor(COLOR_PROGRESS)
-          .addFields(
-            { name: "Status", value: "submitted", inline: true },
-            { name: "Job", value: `\`${id}\``, inline: true },
-          ),
-      ],
-    });
+      },
+      {
+        onCreated: (created) => {
+          id = created.id;
+          console.log(`[sim] submitted ${id}`);
+        },
+        onPoll: (status) => {
+          if (isTerminal(status.status)) return;
+          show(COLOR_PROGRESS, statusFields(id, status)).catch(console.error);
+        },
+      },
+    );
+    console.log(`[sim] ${id} ${job.status}`);
 
-    let status = "";
-    while (!TERMINAL.has(status)) {
-      await sleep(POLL_INTERVAL_MS);
-      const statusRes = await fetch(`${API}/simc/jobs/${id}/status`, {
-        headers: { Authorization: `Bearer ${SIMMIT_SECRET_KEY}` },
-      });
-      if (!statusRes.ok) {
-        throw new Error(
-          `status failed (${statusRes.status}): ${await statusRes.text()}`,
-        );
-      }
-      const body = (await statusRes.json()) as JobStatus;
-      status = body.status;
-      if (!TERMINAL.has(status)) {
-        await interaction.editReply({
-          embeds: [
-            baseEmbed()
-              .setColor(COLOR_PROGRESS)
-              .addFields(statusFields(id, body)),
-          ],
-        });
-      }
-    }
-    console.log(`[sim] ${id} ${status}`);
-
-    const resultRes = await fetch(`${API}/simc/jobs/${id}/result`, {
-      headers: { Authorization: `Bearer ${SIMMIT_SECRET_KEY}` },
-    });
-    if (!resultRes.ok) {
-      throw new Error(
-        `result failed (${resultRes.status}): ${await resultRes.text()}`,
-      );
-    }
-    const { result } = (await resultRes.json()) as {
-      result: {
-        summary?: { mainActor: { mean: number } };
-        artifacts: { kind: string; url: string }[];
-      };
-    };
-
-    if (status !== "completed") {
-      const log =
-        result.artifacts.find((a) => a.kind === "stderr_log") ??
-        result.artifacts.find((a) => a.kind === "stdout_log");
-      const fields: Field[] = [
-        { name: "Status", value: status, inline: true },
+    const { result } = await simmit.jobs.getResult(id);
+    const actor = result.summary?.mainActor;
+    if (!actor) throw new Error("no DPS in the result");
+    await show(COLOR_SUCCESS, [
+      {
+        name: "DPS",
+        value: Math.round(actor.mean).toLocaleString("en-US"),
+        inline: true,
+      },
+      { name: "Job", value: `\`${id}\``, inline: true },
+      { name: "SimC Report", value: `[View report](${job.links.share})` },
+    ]);
+  } catch (err) {
+    console.error("[sim] error:", err);
+    if (err instanceof JobUnsuccessfulError) {
+      await show(COLOR_FAILURE, [
+        { name: "Status", value: err.job.status, inline: true },
         { name: "Job", value: `\`${id}\``, inline: true },
-      ];
-      if (log)
-        fields.push({
-          name: "Error Log",
-          value: `[View log](${log.url})`,
-          inline: false,
-        });
-      await interaction.editReply({
-        embeds: [baseEmbed().setColor(COLOR_FAILURE).addFields(fields)],
-      });
+        { name: "SimC Log", value: `[View sim](${err.job.links.share})` },
+      ]);
       return;
     }
-
-    const dps = Math.round(result.summary!.mainActor.mean).toLocaleString(
-      "en-US",
-    );
-    const html = result.artifacts.find((a) => a.kind === "html_report");
-    if (!html) throw new Error("no HTML artifact returned");
-    await interaction.editReply({
-      embeds: [
-        baseEmbed()
-          .setColor(COLOR_SUCCESS)
-          .addFields(
-            { name: "DPS", value: dps, inline: true },
-            { name: "Job", value: `\`${id}\``, inline: true },
-            {
-              name: "SimC Report",
-              value: `[View report](${html.url})`,
-              inline: false,
-            },
-          ),
-      ],
-    });
-  } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("[sim] error:", err);
-    await interaction.editReply({
-      embeds: [
-        baseEmbed()
-          .setColor(COLOR_FAILURE)
-          .setDescription(message.slice(0, 4000)),
-      ],
-    });
+    await show(COLOR_FAILURE, [
+      { name: "Error", value: message.slice(0, 1024) },
+    ]);
   }
 }
 
-function statusFields(id: string, body: JobStatus): Field[] {
+function statusFields(id: string, status: JobStatusResponse): Field[] {
   const fields: Field[] = [
-    { name: "Status", value: body.status, inline: true },
+    { name: "Status", value: status.status, inline: true },
   ];
-  if (body.status === "queued" && body.queue?.estimatedStartSeconds != null) {
-    fields.push({
-      name: "ETA",
-      value: `~${Math.round(body.queue.estimatedStartSeconds)}s`,
-      inline: true,
-    });
-  } else if (body.status === "running" && body.progress?.percent != null) {
+  const eta = status.queue?.estimatedStartSeconds;
+  const percent = status.progress.percent;
+  if (status.status === "queued" && eta != null) {
+    fields.push({ name: "ETA", value: `~${Math.round(eta)}s`, inline: true });
+  } else if (status.status === "running" && percent != null) {
     fields.push({
       name: "Progress",
-      value: `${Math.round(body.progress.percent)}%`,
+      value: `${Math.round(percent)}%`,
       inline: true,
     });
   }
   fields.push({ name: "Job", value: `\`${id}\``, inline: true });
   return fields;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 await client.login(DISCORD_TOKEN);
